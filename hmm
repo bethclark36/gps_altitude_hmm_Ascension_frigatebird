@@ -1,3 +1,14 @@
+#Code for running Hidden Markov Models in "momentuHMM"
+#for classifying Ascension frigatebird behavioural states
+#in order to identifying foraging behaviours.
+#Models with and without altitude, and compares the states
+#when using altitude derived from barometric pressure 
+#and GPS (more error prone).
+# - Bethany Clark & Sam Weber 2020
+#See Clark et al. 2020 First three-dimensional tracks for the
+#Ascension Frigatebird Fregata aquila highlight the importance
+#of altitude for behavioural studies. Seabird.
+
 library(cowplot)
 library(lubridate)
 library(sf)
@@ -12,63 +23,76 @@ library(ggplot2)
 
 rm(list=ls())
 
-# Fit a 2D model using interpolated data ####
-
-data=read.csv('C:/Users/me/Documents/Sync/Documents2TB/Non-PhD/Ascension/Altitude_processing/geoid/1_HHM_prep.csv')
+#read in data
+data <- read.csv("file.csv")
 
 head(data)
 
-sum(data$p_interp<=0) # Only 11 points < 0m that need adjusting
+#p_interp = regularised altitude from barometric pressure
+#Check for altitude below zero
+sum(data$p_interp<=0) #11 points (0.2% of locations) are <0m 
+#These will be adjusted to 0.1m to allow us to use the Gamma distribution
+
+# Fit a 2D model using interpolated data ####
 
 #Set up dataframe for HMM
-hmm_data = dplyr::select(data,"ID" = bird_trip,Longitude,Latitude,
-                         altitude = p_interp,time = Abstime) %>%
-  mutate(altitude = ifelse(altitude<0,0.1,altitude)) %>%
-  prepData(type="LL",coordNames=c("Longitude","Latitude")) %>%
-  mutate(step = ifelse(step==0,0.1,step))
-class(hmm_data) = c('momentuHMMData','data.frame')
+hmm_data <- dplyr::select(data,"ID" = bird_trip,Longitude,Latitude, #choose columns
+                          altitude = p_interp,time = Abstime) %>% 
+  mutate(altitude = ifelse(altitude<0,0.1,altitude)) %>% #adjust altitude values below 0
+  prepData(type="LL",coordNames=c("Longitude","Latitude")) %>% #prep data function from momentuHMM
+  mutate(step = ifelse(step==0,0.1,step)) #adjust any steps that are 0 to 0.1
+class(hmm_data) <- c('momentuHMMData','data.frame') #set class to use HMM
 
 # Fit HMMs with 1-5 states and use the 'elbow criterion' to 
 # identify number when addition of new states results in relatively 
 # small improvement in fit.
 
-hmms = list()
+hmms <- list() #step up a list for the results
 
-for(states in 1:5){
+for(states in 1:5){ #loop to run models with different numbers of states
   
-  #starting values
-  k         <- na.omit(dplyr::select(hmm_data,step,angle)) 
-  k1        <- mutate(k,angle=abs(angle))
-  clus      <- kmeans(k1,states)
-  stp_init  <- clus$centers[,1]
+  #starting values identified using k-means 
+  k         <- na.omit(dplyr::select(hmm_data,step,angle)) #remove NAs
+  k1        <- mutate(k,angle=abs(angle)) #set angle to absolute value
+  clus      <- kmeans(k1,states) #find clusters equal to the number of states
+  stp_init  <- clus$centers[,1] #save the step length means
   stp_sd    <- aggregate(k[,1]~fitted(clus,method="classes"),
-                         FUN=sd)[,2]
-  stepPar0  <- c(stp_init,stp_sd)
+                         FUN=sd)[,2] #save the standard deviations
+  stepPar0  <- c(stp_init,stp_sd) #combine the means and sds
   anglePar0 <- aggregate(k[,2]~fitted(clus,method="classes"),
-                         FUN=est.kappa)[,2]
+                         FUN=est.kappa)[,2] #save the angle standard deviations
   
-  #fit HMMs
-  hmms[[states]] =  fitHMM(hmm_data,nbStates=states,
-                           dist=list(step='gamma',angle='vm'),
-                           Par0=list(step=stepPar0,angle=anglePar0,
-                                     retryFits=10,retrySD=list(step=0.5,angle=0.5)))
+  #fit an HMM for each number of states
+  hmms[[states]] =  fitHMM(hmm_data, #data
+                           nbStates=states, #number of states
+                           dist=list(step='gamma',angle='vm'), #distributions
+                           Par0=list(step=stepPar0,angle=anglePar0, #starting parameters
+                                     retryFits=10, #rretry to petrubstarting parameters
+                                     retrySD=list(step=0.5,angle=0.5))) 
 }
 
-#plot AICs
-ggplot(mapping=aes(x=1:5,y=sapply(hmms,AIC))) + geom_line() + geom_point()
+#plot AICs shows the optimal number of states, 
+#where the line flattens out
+ggplot(mapping=aes(x=1:5,y=sapply(hmms,AIC))) +
+  geom_line() + geom_point()
 
 # 3 state probably best, in agreement with Austin et al. 2019
-hmm = hmms[[3]]
+hmm <- hmms[[3]] #choose this model
 
-states<-viterbi(hmm)
+states <- viterbi(hmm) #run the viterbi algorithm to extract states
 
-parameters = data.frame(t(rbind(hmm$mle$step,hmm$mle$angle,hmm$mle$altitude))) %>%
+#extract the parameters for plotting
+parameters <- data.frame(t(rbind(hmm$mle$step,hmm$mle$angle,hmm$mle$altitude))) %>%
   setNames(c("speed_mean","speed_sd","angle_mean","angle_concentration")) %>%
   mutate_at(vars(speed_mean,speed_sd),function(x) x*(60/5)) # steps are measured in km per 5 minute interval
 
-plot(hmm)
+plot(hmm) #plot the model
 parameters
 
+#interpret the states based on the parameters
+#Travel fast has the highest mean speed, 
+#Forage/ARS has the lowest angle concentration, 
+#Travel slow is remaining.
 parameters$state <- 'Travel slow'
 parameters$state[which.max(parameters$speed_mean)]    <- 'Travel fast'
 parameters$state[which.min(parameters$angle_concentration)]    <- 'Forage/ARS'
@@ -78,39 +102,50 @@ parameters
 #attach behaviours back to original dataframe using state sequence
 hmm_data$state <- parameters[states,"state"]
 
-group_by(hmm_data,state) %>% summarise(n=n(),P = n()/nrow(hmm_data)*100)
+#calculate percentages of each state
+group_by(hmm_data,state) %>% summarise(n_locations = n(),
+                                       Percent = n()/nrow(hmm_data)*100)
 
-#work out the height of the 59.5% foraging ####
+# 59.5% is classified as foraging 
 
-# 3D version incorporating barometric altitude ####
+# Fit a 3D HMM incorporating barometric altitude ####
 
 hmms_3d = list()
 
-for(states in 1:5){
+#Run the same loop as before, with altitude now inlcuded as a data stream
+#But running up to 8 states the curve it quite steep for 1-5
+for(states in 1:8){
   
-  k         <- na.omit(dplyr::select(hmm_data,step,angle,altitude)) 
+  k         <- na.omit(dplyr::select(hmm_data,step,angle,altitude)) #add altitude to the parameters list
   k1        <- mutate(k,angle=abs(angle))
   clus      <- kmeans(k1,states)
   stp_init  <- clus$centers[,1]
   stp_sd    <- aggregate(k[,1]~fitted(clus,method="classes"),FUN=sd)[,2]
   stepPar0  <- c(stp_init,stp_sd)
   anglePar0 <- aggregate(k[,2]~fitted(clus,method="classes"),FUN=est.kappa)[,2]
-  alt_init  <- clus$centers[,3]
-  alt_sd    <- aggregate(k[,3]~fitted(clus,method="classes"),FUN=sd)[,2]
-  altPar0   <- c(alt_init,alt_sd)
+  alt_init  <- clus$centers[,3] #save mean for altitude
+  alt_sd    <- aggregate(k[,3]~fitted(clus,method="classes"),FUN=sd)[,2] #save sd for alitude
+  altPar0   <- c(alt_init,alt_sd) #combine mean & sd
   
-  hmms_3d[[states]] =  fitHMM(hmm_data,nbStates=states,dist=list(step='gamma',angle='vm',altitude='gamma'),
-                              Par0=list(step=stepPar0,angle=anglePar0,altitude=altPar0,retryFits=10,retrySD=list(step=0.5,angle=0.5,altitude=50)))
+  hmms_3d[[states]] =  fitHMM(hmm_data,
+                              nbStates=states,
+                              dist=list(step='gamma',angle='vm',altitude='gamma'), #add altitude distribution
+                              Par0=list(step=stepPar0,
+                                        angle=anglePar0,
+                                        altitude=altPar0, #add alitude to starting parameters
+                                        retryFits=10,
+                                        retrySD=list(step=0.5,angle=0.5,altitude=50)))
   
 }
 
-ggplot(mapping=aes(x=1:7,y=sapply(hmms_3d,AIC))) + geom_line() + geom_point()
+ggplot(mapping=aes(x=1:8,y=sapply(hmms_3d,AIC))) + geom_line() + geom_point()
 
-hmm_3d = hmms_3d[[5]]
+#No an obvious elbow, choosen 5-state model
+hmm_3d <- hmms_3d[[5]]
 
-states_3d<-viterbi(hmm_3d)
+states_3d <- viterbi(hmm_3d)
 
-parameters_3d = data.frame(t(rbind(hmm_3d$mle$step,hmm_3d$mle$angle,hmm_3d$mle$altitude))) %>%
+parameters_3d <- data.frame(t(rbind(hmm_3d$mle$step,hmm_3d$mle$angle,hmm_3d$mle$altitude))) %>%
   setNames(c("speed_mean","speed_sd","angle_mean","angle_concentration","altitude_mean","altitude_sd")) %>%
   mutate_at(vars(speed_mean,speed_sd),function(x) x*(60/5))  # steps are measured in km per 5 minute interval
 
@@ -119,9 +154,17 @@ parameters_3d
 #Five states, interpretted as:
 #'Travel (slow)','Thermalling','Low-altitude ARS','Mid-altitude ARS','Travel (fast)'
 
+#Interpret the states based on the parameters:
+#Thermal/glide has the highest mean altitude,
+#Low-altitude ARS has the lowest mean altitude,
+#Of the remaining states,
+#Travel fast/high has the highest mean speed, 
+#Mid-altitude ARS has the lowest mean speed,
+#Travel slow/mid is remaining.
+
 parameters_3d_states <- parameters_3d
 
-parameters_3d_states$state <- 'Travel slow/mid'
+parameters_3d_states$state <- 'Travel slow/mid' 
 
 parameters_3d_states$state[which.max(parameters_3d_states$altitude_mean)] <- 'Thermal/glide'
 parameters_3d_states$state[which.min(parameters_3d_states$altitude_mean)] <- 'Low-altitude ARS'
@@ -138,28 +181,26 @@ hmm_data$state_3d <- parameters_3d[states_3d,"state"]
 
 round(parameters_3d[,1:6])
 
-#n locations for each state
-table(hmm_data$state_gps)
-#% for each state
-round(table(hmm_data$state_gps)/nrow(hmm_data)*100,1)
+#calculate percentages of each state
+group_by(hmm_data,state_3d) %>% summarise(n_locations = n(),
+                                       Percent = n()/nrow(hmm_data)*100)
 
+#save as geopackage if wanted
+st_as_sf(hmm_data,coords=c('x','y'),crs=4326) %>% st_write('filepath/frig_3d.gpkg',delete_dsn=T)
 
-st_as_sf(hmm_data,coords=c('x','y'),crs=4326) %>% st_write('F:/MANUSCRIPTS/Frig altitude/frig_3d.gpkg',delete_dsn=T)
-
+#check 
 cor.test(~step+altitude,data=subset(hmm_data,grepl('Travel',state_3d)), method = "spearman")
 
 summary(hmm_data)
 travel <- subset(hmm_data,grepl('Travel',state_3d))
 
-
 acf(travel$altitude)
 acf(travel$step)
 
-#check autocorelation and redo correlation
+#check autocorelation and redo correlation after subsample
 subsample <- hmm_data[seq(1,nrow(hmm_data),by=10),]
 acf(subsample$step)
 acf(subsample$altitude)
-
 
 subsample_travel <- subset(subsample,grepl('Travel',state_3d))
 
@@ -169,15 +210,14 @@ hist(subsample_travel$step)
 cor.test(~step+altitude,data=subsample_travel, method = "spearman")
 
 
-
 # Compare 2D and 3D classification performance ####
 
 # Find proportion of different state assginments by altitude
 
-group_by(hmm_data,state_3d) %>% summarise(max_alt = max(altitude),
+alt_summary <- group_by(hmm_data,state_3d) %>% summarise(max_alt = max(altitude),
                                           min_alt = min(altitude)) 
-max_low_alt <- 232
-max_mid_alt <- 344
+max_low_alt <- round(max(alt_summary$max_alt[1]))
+max_mid_alt <- round(max(alt_summary$max_alt[2]))
 
 group_by(hmm_data,state) %>% summarise(N = n(),
                                        P = N/nrow(hmm_data),
@@ -188,25 +228,27 @@ group_by(hmm_data,state) %>% summarise(N = n(),
 
 # Run model replacing barometric with GPS altitude data ####
 
-Par0_3d = getPar(hmm_3d)
+#Get use the previous model o get starting parameters
+Par0_3d <- getPar(hmm_3d)
 
 sum(data$gps_geoid_alt<=0) # 29 points < 0m that need adjusting
 
-head(data)
-
-hmm_gps = dplyr::select(data,"ID" = bird_trip,Longitude,Latitude,
+#prepare data using GPS altitude instead of barometric
+hmm_gps <- dplyr::select(data,"ID" = bird_trip,Longitude,Latitude,
                         altitude = gps_geoid_alt,time = Abstime) %>%
   mutate(altitude = ifelse(altitude<0,0.1,altitude)) %>%
   prepData(type="LL",coordNames=c("Longitude","Latitude")) %>%
   mutate(step = ifelse(step==0,0.1,step))
 class(hmm_gps) = c('momentuHMMData','data.frame')
 
-hmm_gps = fitHMM(hmm_gps,nbStates=5,dist=list(step='gamma',angle='vm',altitude='gamma'),
+#Ruun the 5-state model again with GPS altitude
+hmm_gps <- fitHMM(hmm_gps,nbStates=5,dist=list(step='gamma',angle='vm',altitude='gamma'),
                  Par0=Par0_3d$Par,beta0 = Par0_3d$beta,delta0 = Par0_3d$delta)
-
+#label the states
 states_gps<-viterbi(hmm_gps)
 
-parameters_gps = data.frame(t(rbind(hmm_gps$mle$step,hmm_gps$mle$angle,hmm_gps$mle$altitude))) %>%
+#get parameters
+parameters_gps <- data.frame(t(rbind(hmm_gps$mle$step,hmm_gps$mle$angle,hmm_gps$mle$altitude))) %>%
   setNames(c("speed_mean","speed_sd","angle_mean","angle_concentration","altitude_mean","altitude_sd")) %>%
   mutate_at(vars(speed_mean,speed_sd),function(x) x*(60/5))  # steps are measured in km per 5 minute interval
 
@@ -232,17 +274,14 @@ round(parameters_gps[,1:6],1)
 #attach behaviours back to original dataframe using state sequence
 hmm_data$state_gps <- parameters_gps[states_gps,"state"]
 
-#n locations for each state
-table(hmm_data$state_gps)
+#calculate percentages of each state
+group_by(hmm_data,state_3d) %>% summarise(n_locations = n(),
+                                          Percent = n()/nrow(hmm_data)*100)
 
-#% for each state
-round(table(hmm_data$state_gps)/nrow(hmm_data)*100,1)
-
-# confusion matrix ####
-
+#Plot a confusion matrix between barometric & GPS altitude ####
 caret::confusionMatrix(as.factor(hmm_data$state_3d),as.factor(hmm_data$state_gps))
 
-# Create own confusion matrix with percentages
+#Plot our own confusion matrix with percentages
 confusionDF <- data.frame(caret::confusionMatrix(as.factor(hmm_data$state_3d),as.factor(hmm_data$state_gps))$table)
 confusionDF$Reference = with(confusionDF, 
                              factor(Reference, levels = rev(levels(Reference))))
@@ -273,27 +312,31 @@ confusionPlot <- confusionDF %>%
         plot.margin = unit(c(0,2,2,0),'lines'),
         strip.background=element_rect(colour='black',fill='transparent',size=0.6));confusionPlot
 
-filepath <- "C:/Users/me/Documents/Sync/Documents2TB/Non-PhD/Ascension/Altitude_processing/geoid/"
+filepath <- ""
 ggsave(paste0(filepath,'confusion_matrix.png'),
        confusionPlot,width=5.5,height=5.5,dpi=600)
 
-#Plot outputs ####
+#Plot states interms of altitude for all 3 models ####
 
-data$gps_2d_state <- hmm_data$state
+#add states to original data (not adjusted to be above 0)
+data$gps_2d_state <- hmm_data$state 
 data$gps_p_state <- hmm_data$state_3d
 data$gps_3d_state <- hmm_data$state_gps  
 
+#create a time in days from the start of the trip
 data$time_secs <- data$Abstime - min(data$Abstime)
 data$time_days <- data$time_secs/(60*60*24)
-data$birdID_label <- paste0("Bird ",data$birdID)
+data$birdID_label <- paste0("Bird ",data$birdID) #add labels
 
 head(data)
 
 range(data$P_Alt)
 range(data$gps_geoid_alt)
 
+#create a list of birds
 birds <- unique(data$birdID)
 
+#create plots for each bird for 2d
 plots_2d <- list()
 for(i in 1:length(birds)){
   bird <- subset(data,birdID == birds[i])
@@ -322,6 +365,7 @@ for(i in 1:length(birds)){
   plots_2d[[i]] <- plot_2d
 }
 
+#creat plots for 3d using barometric altitude
 plots_p <- list()
 
 for(i in 1:length(birds)){
@@ -329,7 +373,7 @@ for(i in 1:length(birds)){
   plot_p <- ggplot(bird)+
     geom_line(aes(time_days,P_Alt)) +
     geom_point(aes(time_days,P_Alt,colour=gps_p_state, 
-                                alpha=0.6),size=2)+
+                   alpha=0.6),size=2)+
     geom_hline(yintercept=0,colour="grey",size=0.5) + 
     geom_hline(yintercept=median(data$P_Alt),colour="black",size=0.5) + 
     theme_bw()+
@@ -352,9 +396,7 @@ for(i in 1:length(birds)){
   plots_p[[i]] <- plot_p
 }
 
-#saved 2200x2200
-
-
+#create plots for 3d using GPS altitude
 plots_gps <- list()
 
 for(i in 1:length(birds)){
@@ -362,14 +404,14 @@ for(i in 1:length(birds)){
   plot_gps <- ggplot(bird)+
     geom_line(aes(time_days,gps_geoid_alt)) +
     geom_point(aes(time_days,gps_geoid_alt,colour=gps_3d_state, 
-                                alpha=0.6),size=2)+
+                   alpha=0.6),size=2)+
     geom_hline(yintercept=0,colour="grey",size=0.5) + 
     geom_hline(yintercept=median(data$P_Alt),colour="black",size=0.5) + 
     theme_bw()+
     theme(text = element_text(size=18),
           axis.text = element_text(size=16)) +
-      theme(axis.text=element_text(colour="black")) +
-       ylab("GPS altitude (m)")+
+    theme(axis.text=element_text(colour="black")) +
+    ylab("GPS altitude (m)")+
     xlab("Time (days)")+
     guides(alpha=F)+
     scale_color_manual(values = c("Low-altitude ARS"="#B3063C",
@@ -386,7 +428,7 @@ for(i in 1:length(birds)){
 }
 
 
-
+#use cowplot to combine into 3 panels for each bird
 i=1;bird1 <-plot_grid(plots_2d[[i]],plots_p[[i]],plots_gps[[i]],
                       ncol=1,labels="auto",
                       label_x = 0.96, label_y = 0.98);bird1
